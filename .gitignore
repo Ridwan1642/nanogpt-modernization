@@ -1,0 +1,3 @@
+ckpt_*.pt
+input.txt
+__pycache__/

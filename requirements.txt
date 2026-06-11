@@ -1,0 +1,4 @@
+# RTX 50-series (Blackwell) requires PyTorch >= 2.7 with CUDA 12.8 wheels:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+matplotlib  # only needed for plot_curves.py
