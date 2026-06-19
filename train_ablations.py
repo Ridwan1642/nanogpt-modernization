@@ -31,7 +31,7 @@ n_head = 6
 n_layer = 6
 dropout = 0.2
 SEED = 1337
-USE_COMPILE = True   # set False if torch.compile misbehaves on Windows
+USE_COMPILE = False
 RESULTS_FILE = 'results.md'
 # -------------------------------------------------------------------------------
 
@@ -60,22 +60,22 @@ train_data = data[:n]
 val_data = data[n:]
 
 
-def get_batch(split):
+def get_batch(split, g):
     d = train_data if split == 'train' else val_data
-    ix = torch.randint(len(d) - block_size, (batch_size,))
+    ix = torch.randint(len(d) - block_size, (batch_size,), generator=g)
     x = torch.stack([d[i:i + block_size] for i in ix])
     y = torch.stack([d[i + 1:i + block_size + 1] for i in ix])
     return x.to(device), y.to(device)
 
 
 @torch.no_grad()
-def estimate_loss(model):
+def estimate_loss(model, g):
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, g)
             _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
@@ -87,12 +87,11 @@ def estimate_loss(model):
 def precompute_freqs_cis(head_dim, max_seq_len, base=10000.0):
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
     t = torch.arange(max_seq_len).float()
-    freqs = torch.outer(t, inv_freq)                    # (T, head_dim/2)
-    return torch.polar(torch.ones_like(freqs), freqs)   # e^{i m theta}, complex64
+    freqs = torch.outer(t, inv_freq)                    
+    return torch.polar(torch.ones_like(freqs), freqs)   
 
 
 def apply_rope(x, freqs_cis):
-    # x: (B, T, head_dim); freqs_cis: (T, head_dim/2)
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     out = torch.view_as_real(xc * freqs_cis)
     return out.flatten(-2).type_as(x)
@@ -170,7 +169,7 @@ class FeedForward(nn.Module):
 class SwiGLUFFN(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
-        hidden = int(2 / 3 * 4 * n_embd)  # param-matched to the 4x ReLU FFN
+        hidden = int(2 / 3 * 4 * n_embd)  
         self.w_gate = nn.Linear(n_embd, hidden, bias=False)
         self.w_up = nn.Linear(n_embd, hidden, bias=False)
         self.w_down = nn.Linear(hidden, n_embd, bias=False)
@@ -241,8 +240,9 @@ def log(msg):
 
 
 def train_one(name, cfg):
-    # identical seed per run: same init RNG stream and same batch order
     torch.manual_seed(SEED)
+    data_gen=torch.Generator()
+    data_gen.manual_seed(SEED)
     if USE_COMPILE:
         torch._dynamo.reset()
 
@@ -265,11 +265,11 @@ def train_one(name, cfg):
     train_time = 0.0
     for it in range(max_iters):
         if it % eval_interval == 0 or it == max_iters - 1:
-            losses = estimate_loss(model)
+            losses = estimate_loss(model, data_gen)
             best_val = min(best_val, losses['val'])
             log(f"  step {it}: train {losses['train']:.4f}, val {losses['val']:.4f}")
 
-        xb, yb = get_batch('train')
+        xb, yb = get_batch('train', data_gen)
         if device == 'cuda':
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -281,7 +281,7 @@ def train_one(name, cfg):
             torch.cuda.synchronize()
         train_time += time.perf_counter() - t0
 
-    final = estimate_loss(model)
+    final = estimate_loss(model, data_gen)
     best_val = min(best_val, final['val'])
     tok_per_s = max_iters * batch_size * block_size / train_time
 
@@ -301,8 +301,6 @@ def main():
     t_start = time.time()
     for name, cfg in ABLATIONS:
         summaries.append(train_one(name, cfg))
-
-        # rewrite the summary table after every run, so a crash loses nothing
         table = ['\n## Summary (so far)\n',
                  '| variant | params (M) | final train | final val | best val | tok/s | train min |',
                  '|---|---|---|---|---|---|---|']
